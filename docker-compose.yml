@@ -1,0 +1,52 @@
+#for build and start our containers
+version: "2.2"
+services:
+  bot:
+    image: bot_image
+    build:
+        context: ./bot
+    environment:
+      - TOKEN=${TOKEN}
+      - RM_HOST=${RM_HOST}
+      - RM_PORT=${RM_PORT}
+      - RM_USER=${RM_USER}
+      - RM_PASSWORD=${RM_PASSWORD}
+      - DB_USER=${DB_USER}
+      - DB_PASSWORD=${DB_PASSWORD}
+      - DB_HOST=${DB_HOST}
+      - DB_PORT=${DB_PORT}
+      - DB_DATABASE=${DB_DATABASE}
+    volumes:
+      - pg_logs:/var/log/
+    container_name: "${BOT}"
+  db:
+    image: db_image
+    build: ./db
+    volumes:
+      - pg_logs:/var/log/
+    environment:
+      - POSTGRES_USER=${DB_USER}
+      - POSTGRES_PASSWORD=${DB_PASSWORD}
+      - DB_REPL_USER=${DB_REPL_USER}
+      - DB_REPL_PASSWORD=${DB_REPL_PASSWORD}
+      - DB_REPL_HOST=${DB_REPL_HOST}.my_network
+      - DB_PORT=${DB_PORT}
+      - DB_DATABASE=${DB_DATABASE}
+    container_name: "${DB_HOST}"
+  db_repl:
+    image: db_repl_image
+    build: ./db_repl
+    container_name: "${DB_REPL_HOST}"
+    environment:
+      - DB_HOST=${DB_HOST}.my_network
+      - DB_PORT=${DB_PORT}
+      - DB_REPL_HOST=${DB_REPL_HOST}
+      - DB_REPL_PORT=${DB_REPL_PORT}
+      - DB_REPL_USER=${DB_REPL_USER}
+      - DB_REPL_PASSWORD=${DB_REPL_PASSWORD}
+volumes:
+  pg_data:
+  pg_logs:
+networks:
+  default:
+     name: my_network
