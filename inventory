@@ -1,0 +1,5 @@
+bot ansible_host="{{invent.bot.host}}" ansible_user="{{invent.bot.user}}" ansible_password="{{invent.bot.password}}"
+
+db ansible_host="{{invent.db.host}}" ansible_user="{{invent.db.user}}" ansible_password="{{invent.db.password}}"
+
+db_repl ansible_host="{{invent.db_repl.host}}" ansible_user="{{invent.db_repl.user}}" ansible_password="{{invent.db_repl.password}}"

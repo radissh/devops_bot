@@ -1,0 +1,419 @@
+- name: db playbook
+  hosts: db
+  vars:
+    archive_dir: "/oracle/pg_data/archive/"
+  tasks:
+    - name: Сache update
+      apt:
+        update_cache: yes
+        cache_valid_time: 86400
+      become: yes
+      
+    - name: Install required packages
+      ansible.builtin.apt:
+        name: 
+          - postgresql
+          - postgresql-contrib
+          - jq
+          - python3-pip
+        state: latest
+      become: yes
+
+    - name: Install psycopg
+      ansible.builtin.apt:
+        name: python3-psycopg2
+      become: yes
+      
+    - name: Create archive directory
+      ansible.builtin.file:
+        path: "{{archive_dir}}"
+        state: directory
+        owner: "postgres"
+        mode: 0750
+      become: yes
+      
+    - block:
+
+      - name: Find out if PostgreSQL is initialized
+        ansible.builtin.command: 
+          cmd: "pg_ctlcluster 16 main status"
+        register: postgres_status
+        ignore_errors: true
+        become: yes
+
+      - name: Initialize PostgreSQL
+        ansible.builtin.command: 
+          cmd: "pg_createcluster 16 main"
+        when: postgres_status.stdout.find('specified cluster \'16 main\' does not exist') != -1
+        become: yes
+
+      - name: Get pg_hba path
+        ansible.builtin.shell: "pg_lsclusters --json | jq '.[].config.hba_file' | awk '{gsub(/\"/, \"\", $1); print $1}'"
+        register: pg_hba_path
+
+      - name: Get postgresql.conf path
+        ansible.builtin.shell: "pg_lsclusters --json | jq '.[].configdir' | awk '{gsub(/\"/, \"\", $1); print $1}'"
+        register: pg_conf_path
+
+      - name: Setup pg_hba.conf
+        ansible.builtin.blockinfile:
+          create: true
+          path: "{{pg_hba_path.stdout}}"
+          block: | 
+            local all {{databases.master.user}} peer
+            host all all 0.0.0.0/0 password
+            host replication {{databases.replica.user}} {{invent.db_repl.host}}/24 trust
+        become: yes
+
+      - name: Setup postgresql.conf
+        ansible.builtin.blockinfile:
+          create: true
+          path: "{{pg_conf_path.stdout}}/postgresql.conf"
+          block: | 
+            listen_addresses = '*'
+            port = {{databases.master.port}}
+            log_destination = 'stderr'
+            logging_collector = on
+            log_directory = '/var/log/postgresql/'
+            log_filename = 'postgresql.log'
+            log_file_mode = 0644
+            archive_mode = on
+            archive_command = 'cp %p {{archive_dir}}/%f'
+            max_wal_senders = 10
+            wal_level = replica
+            wal_log_hints = on
+            log_replication_commands = on
+        become: yes
+
+      - name: Restart PostgreSQL
+        ansible.builtin.service:
+          name: postgresql@16-main
+          state: restarted
+        become: yes
+        become_user: root
+
+      - name: Create app database
+        community.postgresql.postgresql_db:
+          state: present
+          name: "{{databases.master.database}}"
+        become: yes
+
+      - name: Grant all privileges on db_bot to custom user
+        community.postgresql.postgresql_privs:
+          db: "{{databases.master.database}}"
+          role: "{{databases.master.user}}"
+          type: "database"
+          privs: "ALL"
+        become: yes
+
+      - name: Grant all privileges on all tables in schema public to postgres user
+        community.postgresql.postgresql_privs:
+          db: "{{databases.master.database}}"
+          role: "{{databases.master.user}}"
+          type: "table"
+          privs: "ALL"
+          objs: "ALL_IN_SCHEMA"
+        become: yes
+
+      - name: Grant all privileges on schema public to postgres user
+        community.postgresql.postgresql_privs:
+            db: "{{databases.master.database}}"
+            role: "postgres"
+            type: "schema"
+            privs: "ALL"
+            objs: "public"
+        become: yes  
+
+      - name: Create table Emails
+        community.postgresql.postgresql_table:
+          table: emails
+          db: "{{databases.master.database}}"
+          columns:
+           - emailID serial primary key
+           - email varchar(64) not null
+        become: yes
+
+      - name: Create table Phones
+        community.postgresql.postgresql_table:
+          table: phones
+          db: "{{databases.master.database}}"
+          columns:
+           - phoneID serial primary key
+           - phone varchar(64) not null
+        become: yes
+
+      - name: Set master user password
+        community.postgresql.postgresql_user:
+          name: "{{databases.master.user}}"
+          password: "{{databases.master.password}}"
+        become: yes
+
+      - name: Create repl_user
+        community.postgresql.postgresql_user:
+          name: "{{databases.replica.user}}"
+          password: "{{databases.replica.password}}"
+          role_attr_flags: REPLICATION,LOGIN
+        become: yes
+
+      - name: Check if Emails table is empty
+        community.postgresql.postgresql_query:
+          db: "{{ databases.master.database }}"
+          login_user: "{{ databases.master.user }}"
+          login_password: "{{ databases.master.password }}"
+          query: "SELECT COUNT(*) FROM emails;"
+        register: emails_count
+        become: yes
+      
+      - name: Insert data into Emails table if it`s empty
+        ansible.builtin.command: psql -U {{ databases.master.user }} -d {{ databases.master.database }} -c "INSERT INTO emails (email) VALUES ('guhkuhug@yandex.ru'), ('redisko@mail.com');"
+        when: emails_count.query_result[0].count|int == 0
+        become: yes
+
+      - name: Check if Phones table is empty
+        community.postgresql.postgresql_query:
+          db: "{{ databases.master.database }}"
+          login_user: "{{ databases.master.user }}"
+          login_password: "{{ databases.master.password }}"
+          query: "SELECT COUNT(*) FROM phones;"
+        register: phones_count
+        become: yes
+
+      - name: Insert data into Phones table if it`s empty
+        ansible.builtin.command: psql -U {{ databases.master.user }} -d {{ databases.master.database }} -c "INSERT INTO phones (phone) VALUES ('+7 (666) 555 44 33'), ('88000004422');"
+        when: phones_count.query_result[0].count|int == 0
+        become: yes
+        
+      become_user: postgres
+    
+- name: db_repl playbook
+  hosts: db_repl
+  tasks:
+
+    - name: Сache update
+      apt:
+        update_cache: yes
+        cache_valid_time: 86400
+      become: yes
+      
+    - name: Install required packages
+      ansible.builtin.apt:
+        name: 
+          - postgresql
+          - postgresql-contrib
+          - jq
+          - python3-pip
+        state: latest
+      become: yes
+
+    - name: Install psycopg
+      ansible.builtin.apt:
+        name: python3-psycopg2
+      become: yes
+      
+    - block:
+
+      - name: Check postgres initialized
+        ansible.builtin.command: 
+          cmd: "pg_ctlcluster 16 main status"
+        register: postgres_status
+        ignore_errors: true
+        become: yes
+
+      - name: Initialize PostgreSQL
+        ansible.builtin.command: 
+          cmd: "pg_createcluster 13 main"
+        when: postgres_status.stdout.find('specified cluster \'13 main\' does not exist') != -1
+        become: yes
+
+      - name: Get postgresql.conf path
+        ansible.builtin.shell: "pg_lsclusters --json | jq '.[].configdir' | awk '{gsub(/\"/, \"\", $1); print $1}'"
+        register: pg_conf_path
+
+      - name: Setup postgresql.conf
+        ansible.builtin.blockinfile:
+          create: true
+          path: "{{pg_conf_path.stdout}}/postgresql.conf"
+          block: | 
+            listen_addresses = 'localhost, {{invent.db_repl.host}}'
+            port = {{databases.replica.port}}
+        become: yes
+
+      - name: Stop PostgreSQL
+        ansible.builtin.service:
+          name: postgresql@16-main
+          state: stopped
+        become: yes
+        become_user: root
+
+      - name: Get directory for backup
+        ansible.builtin.shell: "pg_lsclusters --json | jq '.[].pgdata' | awk '{gsub(/\"/, \"\", $1); print $1}'"
+        register: data_dir
+
+      - name: Clean up directory
+        ansible.builtin.file:
+          state: "{{item}}"
+          path: "{{data_dir.stdout}}"
+          owner: postgres
+          group: postgres
+          mode: 0750
+        with_items:
+          - absent
+          - directory
+        become: yes
+        become_user: root
+
+      - name: Execute pg_basebackup
+        ansible.builtin.command:
+          cmd: |
+            pg_basebackup -v -R
+              -h {{invent.db.host}} -p {{databases.master.port}}
+              -U {{databases.replica.user}} -w -P
+              -D {{data_dir.stdout}}
+        become: yes
+        environment:
+          PGPASSWORD: "{{ databases.replica.password }}"
+
+      - name: Start PostgreSQL
+        ansible.builtin.service:
+          name: postgresql@16-main
+          state: started
+        become: yes
+        become_user: root
+
+      become_user: postgres
+
+- name: bot playbook
+  hosts: bot
+  tasks:
+
+    - name: Сache update
+      apt:
+        update_cache: yes
+        cache_valid_time: 86400
+      become: yes
+
+    - name: Install required packages
+      ansible.builtin.apt:
+        name: 
+          - python3.11
+          - python3.11-dev
+          - python3-pip
+          - libpq-dev
+          - git
+          - python3-venv
+        state: latest
+      become: yes
+
+    - name: Install virtualenv package
+      ansible.builtin.pip:
+        name: virtualenv
+      become: yes
+
+    - name: Create workdir
+      ansible.builtin.file:
+        path: "{{invent.bot.bot_directory}}"
+        state: directory
+        owner: "{{ansible_user}}"
+        mode: 0777
+      become: yes
+
+    - name: Clone bot from git
+      ansible.builtin.git:
+        repo: https://github.com/radissh/devops_bot.git
+        version: docker
+        dest: "{{invent.bot.bot_directory}}"
+        clone: true
+
+    - name: Create virtual environment using virtualenv
+      command: virtualenv -p python3.11 {{invent.bot.bot_directory}}/bot/venv
+      become: yes
+
+    - name: Upgrade pip in virtual environment
+      command: "{{invent.bot.bot_directory}}/bot/venv/bin/pip install --upgrade pip"
+      become: yes
+
+    - name: Install packages from requirements
+      command: "{{invent.bot.bot_directory}}/bot/venv/bin/pip install -r {{invent.bot.bot_directory}}/bot/requirements.txt"
+      become: yes
+
+    - name: Setup environment
+      ansible.builtin.copy:
+        content: |
+          TOKEN={{telegram.token}}
+
+          DB_HOST={{invent.db.host}}
+          DB_PORT={{databases.master.port}}
+          DB_DATABASE={{databases.master.database}}
+          DB_USER={{databases.master.user}}
+          DB_PASSWORD={{databases.master.password}}
+
+          RM_HOST={{remote_access.host}}
+          RM_PORT={{remote_access.port}}
+          RM_USER={{remote_access.user}}
+          RM_PASSWORD={{remote_access.password}}
+
+          PATH_TO_LOGFILE={{remote_access.logfile}}
+          PATH_TO_TEMPFILE={{remote_access.tempfile}}
+
+          RM_LOGS_HOST={{invent.db.host}}
+          RM_LOGS_PORT={{remote_access.port}}
+          RM_LOGS_USER={{invent.db.user}}
+          RM_LOGS_PASSWORD={{invent.db.password}}
+        dest: "{{invent.bot.bot_directory}}/.env"
+      become: yes
+
+    - name: Create systemd service file for bot
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/bot.service
+        content: |
+          [Unit]
+          Description=Bot Service
+          After=network.target
+
+          [Service]
+          User={{ invent.bot.user }}
+          Group={{ invent.bot.user }}
+          WorkingDirectory={{ invent.bot.bot_directory }}/bot
+          Environment="PATH={{ invent.bot.bot_directory }}/bot/venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+          Environment="PYTHONPATH={{ invent.bot.bot_directory }}/bot/venv/lib/python3.11/site-packages"
+          ExecStart={{ invent.bot.bot_directory }}/bot/venv/bin/python3 {{ invent.bot.bot_directory }}/bot/bot.py
+          Restart=always
+
+          [Install]
+          WantedBy=multi-user.target
+      become: yes
+
+    - name: Ensure logfile directory exists
+      file:
+        path: "{{ invent.bot.bot_directory }}/bot/tbot_logfile.txt"
+        state: touch
+        owner: "{{ invent.bot.user }}"
+        group: "{{ invent.bot.user }}"
+        mode: '0664'
+      become: yes
+
+    - name: Change ownership of the bot directory
+      file:
+        path: "{{ invent.bot.bot_directory }}"
+        state: directory
+        recurse: yes
+        owner: "{{ invent.bot.user }}"
+        group: "{{ invent.bot.user }}"
+      become: yes
+
+    - name: Reload systemd to recognize the new service
+      ansible.builtin.command: systemctl daemon-reload
+      become: yes
+
+    - name: Enable bot service to start on boot
+      ansible.builtin.systemd:
+        name: bot
+        enabled: yes
+      become: yes
+
+    - name: Start bot service
+      ansible.builtin.systemd:
+        name: bot
+        state: started
+      become: yes
+
